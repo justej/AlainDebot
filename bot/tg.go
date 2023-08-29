@@ -6,8 +6,30 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	tg "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+const (
+	introductionMessage = "Let me introduce myself. I'm Alain Fabien Maurice Marcel Delon bot, I take care of movies. With my help you can add movies you would like to watch, rate your and other's movies."
+	mainMessage         = "So what you're gonna do?"
+	startMessage        = introductionMessage + "\n\n" + mainMessage
+	helpMessage         = introductionMessage + `
+
+For CLI nerds there's a bunch of one-line commands. These commands, however, require following the precise message format. []'d values are optional.
+/add - add new movie. Format: /add "<title>"/["<alternative title>"][(<year>)]
+/del - delete movie. Format: /del <movie ID>
+/rate - rate movie (1-5). Format: /rate <movie ID> <rating>
+/unrate - unrate movie. Format: /unrate <movie ID>
+/amazeme - show a random unseen movie
+/unseen - list unseen movies
+/seen - list seen movies
+/all - list both unseen and seen movies
+/top - list top 10 movies
+/latest - list 10 latest movies
+/find - find movie by name or year. Format: /find <case-insensitive name or year>
+/help - this help`
 )
 
 var bot *tg.BotAPI
@@ -36,6 +58,9 @@ func Run() {
 				go handleUpdate(&u)
 			}
 		}
+		if u.CallbackQuery != nil {
+			go handleCallbackQuery(&u)
+		}
 	}
 
 }
@@ -46,32 +71,37 @@ type command struct {
 }
 
 var (
-	cmdStart   = makeCommand("start")
-	cmdAdd     = makeCommand("add")
-	cmdDel     = makeCommand("del")
-	cmdRate    = makeCommand("rate")
-	cmdUnrate  = makeCommand("unrate")
-	cmdAmazeMe = makeCommand("amazeme")
-	cmdUnseen  = makeCommand("unseen")
-	cmdSeen    = makeCommand("seen")
-	cmdAll     = makeCommand("all")
-	cmdTop     = makeCommand("top")
-	cmdLatest  = makeCommand("latest")
-	cmdFind    = makeCommand("find")
-	cmdHelp    = makeCommand("help")
+	cmdStart = makeCommand("start")
 )
 
-type state uint
+type stage uint
 
-var states = make(map[int64]state)
+type state struct {
+	stage
+	mainMessageID int
+	movie         db.Movie
+}
+
+var states = make(map[int64]*state)
 
 const (
-	stateIdle state = iota
-	stateAdd
-	stateDel
-	stateRate
-	stateUnrate
-	stateFind
+	stageIdle stage = iota
+	stageAdd
+	stageDel
+	stageRate
+	stageUnrate
+	stageAmazeMe
+	stageFind
+	stageList
+	stageHelp
+
+	stageTitle
+	stageAltTitle
+	stageYear
+
+	stageChooseDel
+	stageChooseRate
+	stageChooseUnrate
 )
 
 func makeCommand(c string) *command {
@@ -87,6 +117,10 @@ func handleCommand(upd *tg.Update) {
 	usr := msg.From.ID
 	cht := msg.Chat.ID
 
+	if states[usr] == nil {
+		states[usr] = &state{stage: stageIdle}
+	}
+
 	switch cmd {
 	case cmdStart.name:
 		err := db.AddUser(usr, cht)
@@ -95,369 +129,141 @@ func handleCommand(upd *tg.Update) {
 			return
 		}
 
-		m := tg.NewMessage(cht, "Welcome! Now you can add movies you would like to watch and rate your and other's movies. To see the list of available commands send /help. Happy watching!")
+		m := tg.NewMessage(cht, startMessage)
+		m.ReplyMarkup = mainKeyboard
 		if _, err := bot.Send(m); err != nil {
 			log.Error(usr, err, "failed sending response to user")
 			return
 		}
 
-	case cmdAdd.name:
-		m := tg.NewMessage(cht, "What's the title of the movie?")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-		}
-
-		states[usr] = stateAdd
-
-	case cmdDel.name:
-		txt, ok := listAllMovies(usr, cmd, "Pick the victim\n\n")
-		if !ok {
-			return
-		}
-
-		m := tg.NewMessage(cht, txt)
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		states[usr] = stateDel
-
-	case cmdRate.name:
-		txt, ok := listAllMovies(usr, cmd, "Send me comma separated ID of the movie and the rate (1 to 5), e.g: 42, 5 or 42, 3\n\n")
-		if !ok {
-			return
-		}
-
-		m := tg.NewMessage(cht, txt)
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		states[usr] = stateRate
-
-	case cmdUnrate.name:
-		lst, err := db.ListSeenMovies(usr)
-		if err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		var rated string
-		if len(lst) == 0 {
-			rated = "There's nothing to unrate"
-		} else {
-			rated = joinMovies(lst, "Pick the ID of the movie to unrate:\n\n")
-		}
-
-		m := tg.NewMessage(cht, rated)
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		states[usr] = stateUnrate
-
-	case cmdAmazeMe.name:
-		randomMovie, err := db.RandomMovie(usr)
-		if err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		m := tg.NewMessage(cht, randomMovie)
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-	case cmdUnseen.name:
-		lst, err := db.ListUnseenMovies(usr)
-		if err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		var unseen string
-		if len(lst) == 0 {
-			unseen = "Wow, you've already seen all movies on the list!"
-		} else {
-			unseen = joinMovies(lst, "You haven't seen these yet:\n\n")
-		}
-
-		m := tg.NewMessage(cht, unseen)
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-	case cmdSeen.name:
-		listNotFull := ""
-		lst, err := db.ListSeenMovies(usr)
-		if err != nil {
-			if len(lst) == 0 {
-				log.Errorf(usr, err, "failed handling '%s'", cmd)
-				return
-			}
-
-			listNotFull = "Just in case, this list may be incomplete (sorry for technical issues).\n"
-		}
-
-		var seen string
-		if len(lst) == 0 {
-			seen = "Hm, you have seen none from the list"
-		} else {
-			seen = joinMovies(lst, listNotFull, "You have seen only these movies:\n\n")
-		}
-		m := tg.NewMessage(cht, seen)
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-	case cmdAll.name:
-		lst, err := db.ListAllMovies(usr)
-		if err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		m := tg.NewMessage(cht, joinMovies(lst, "All movies\n\n"))
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-	case cmdTop.name:
-		lst, err := db.ListTopMovies(usr)
-		if err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		m := tg.NewMessage(cht, joinMovies(lst, "Top 10 movies\n\n"))
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-	case cmdLatest.name:
-		lst, err := db.ListLatestMovies(usr)
-		if err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-		m := tg.NewMessage(cht, joinMovies(lst, "10 latest movies\n\n"))
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-	case cmdFind.name:
-		m := tg.NewMessage(cht, "Not implemented yet")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-
-	case cmdHelp.name:
-		help := `Available commands:
-/add - add new movie
-/del - delete movie
-/rate - rate movie
-/unrate - unrate movie
-/amazeme - show a random unseen movie
-/unseen - list unseen movies
-/seen - list seen movies
-/all - list both unseen and seen movies
-/top - list top 10 movies
-/latest - list 10 latest movies
-/find - find movie by name or year
-/help - this help`
-		m := tg.NewMessage(cht, help)
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling '%s'", cmd)
-			return
-		}
-	}
-}
-
-func listAllMovies(usr int64, cmd, suffix string) (string, bool) {
-	movies, err := db.ListAllMovies(usr)
-	if err != nil {
-		log.Errorf(usr, err, "failed handling '%s'", cmd)
-		return "", false
+		states[usr] = &state{mainMessageID: msg.MessageID}
 	}
 
-	return joinMovies(movies, suffix), true
+	dm := tg.NewDeleteMessage(cht, msg.MessageID)
+	// ignore bot.Send errors because it always fails to deserialize response
+	bot.Send(dm)
 }
 
-func joinMovies(movies []db.Movie, suffix ...string) string {
+func joinMovies(movies []*db.Movie, showID bool, prefix ...string) string {
+	prefixLen := 0
+	for _, s := range prefix {
+		prefixLen += len(s)
+	}
+
 	var sb strings.Builder
-	sb.Grow(len(movies) * 20)
-	sb.WriteString(strings.Join(suffix, ""))
+	sb.Grow(len(movies)*20 + prefixLen)
+	sb.WriteString(strings.Join(prefix, ""))
+
 	for _, movie := range movies {
-		var line string
-		if movie.Rating < 0 {
-			line = fmt.Sprintf("%2d: %s (no ⭐ yet)\n", movie.ID, movie.Title)
-		} else {
-			line = fmt.Sprintf("%2d: %s (%.2f ⭐)\n", movie.ID, movie.Title, movie.Rating)
-		}
+		line := formatMovie(movie, showID)
 		sb.WriteString(line)
 	}
 
 	return sb.String()
 }
 
+func formatMovie(mv *db.Movie, showID bool) string {
+	fmtStr := []string{}
+	args := []any{}
+	if showID {
+		fmtStr = append(fmtStr, "%d: ")
+		args = append(args, mv.ID)
+	}
+
+	fmtStr = append(fmtStr, "\"%s\"")
+	args = append(args, mv.Title)
+
+	if len(mv.AltTitle) > 0 {
+		fmtStr = append(fmtStr, "/\"%s\"")
+		args = append(args, mv.AltTitle)
+	}
+
+	if mv.Year > 0 {
+		fmtStr = append(fmtStr, " (%d)")
+		args = append(args, mv.Year)
+	}
+
+	if mv.Rating < 0 {
+		fmtStr = append(fmtStr, " - no ⭐ yet\n")
+	} else {
+		fmtStr = append(fmtStr, " - %.2f ⭐\n")
+		args = append(args, mv.Rating)
+	}
+
+	return fmt.Sprintf(strings.Join(fmtStr, ""), args...)
+}
+
 func handleUpdate(upd *tg.Update) {
 	msg := upd.Message
+	txt := strings.TrimSpace(msg.Text)
 	usr := msg.From.ID
 	cht := msg.Chat.ID
+
 	state := states[usr]
 
-	switch state {
-	case stateIdle:
-		m := tg.NewMessage(cht, "What does this supposed to mean? Pick a command maybe?")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling state '%d'", state)
-			return
-		}
+	var keyboard *tg.InlineKeyboardMarkup
 
-	case stateAdd:
-		title := strings.TrimSpace(msg.Text)
-		err := db.AddMovie(usr, title)
-		if err != nil {
-			log.Errorf(usr, err, "failed adding movie '%s'", title)
-			return
-		}
+	switch state.stage {
+	case stageTitle:
+		keyboard = &keyboardAdd
+		state.stage = stageAdd
+		state.movie.Title = txt
 
-		states[usr] = stateIdle
+	case stageAltTitle:
+		keyboard = &keyboardAdd
+		state.stage = stageAdd
+		state.movie.AltTitle = txt
 
-		m := tg.NewMessage(cht, "Done")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling state '%d'", state)
-			return
-		}
+	case stageYear:
+		keyboard = &keyboardAdd
+		state.stage = stageAdd
 
-	case stateDel:
-		id, err := strconv.Atoi(strings.TrimSpace(msg.Text))
-		if err != nil {
-			log.Warn(usr, "movie ID is not an integer")
-
-			m := tg.NewMessage(cht, "There's no movie with such ID. Try better")
-			if _, err := bot.Send(m); err != nil {
-				log.Error(usr, err, "failed sending error back")
-				states[usr] = stateIdle
+		year, err := strconv.Atoi(txt)
+		if err != nil || year < 1850 || year > time.Now().UTC().Year()+2 {
+			cb := tg.NewCallbackWithAlert(time.Now().UTC().String(), fmt.Sprintf("The value %s doesn't seem a valid year, isn't it?", txt))
+			if _, err = bot.Request(cb); err != nil {
+				log.Error(usr, err, "failed sending alert message")
 			}
-			return
+		} else {
+			state.movie.Year = int16(year)
 		}
 
-		err = db.DelMovie(usr, id)
-		if err != nil {
-			log.Errorf(usr, err, "failed deleting movie '%d'", id)
-			return
-		}
+	case stageChooseDel:
+		keyboard = &keyboardDel
+		state.movie = *movieByID(usr, txt)
+		state.stage = stageDel
 
-		states[usr] = stateIdle
+	case stageChooseRate:
+		keyboard = &keyboardRate
+		state.movie = *movieByID(usr, txt)
+		state.stage = stageRate
 
-		m := tg.NewMessage(cht, "Done")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling state '%d'", state)
-			return
-		}
-
-	case stateRate:
-		parts := strings.Split(msg.Text, ",")
-		if len(parts) != 2 {
-			m := tg.NewMessage(cht, "I only deal with two comma separated values. Try again")
-			if _, err := bot.Send(m); err != nil {
-				log.Error(usr, err, "failed sending rate error back")
-			}
-			states[usr] = stateIdle
-			return
-		}
-
-		id, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-		if err != nil {
-			log.Warn(usr, "movie ID is not an integer")
-
-			m := tg.NewMessage(cht, "There's no movie with such ID. Try better")
-			if _, err := bot.Send(m); err != nil {
-				log.Error(usr, err, "failed sending rate error back")
-			}
-			states[usr] = stateIdle
-			return
-		}
-
-		rate, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-		if err != nil || rate < 1 || rate > 5 {
-			log.Warn(usr, "rate value is not a number or out of range")
-
-			m := tg.NewMessage(cht, "Rate has to be an integer number from 1 to 5")
-			if _, err := bot.Send(m); err != nil {
-				log.Error(usr, err, "failed sending error back")
-			}
-			states[usr] = stateIdle
-			return
-		}
-
-		err = db.RateMovie(usr, id, rate)
-		if err != nil {
-			log.Errorf(usr, err, "failed rating movie '%d'", id)
-			return
-		}
-
-		states[usr] = stateIdle
-
-		m := tg.NewMessage(cht, "Done")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling state '%d'", state)
-			return
-		}
-
-	case stateUnrate:
-		id, err := strconv.Atoi(strings.TrimSpace(msg.Text))
-		if err != nil {
-			log.Warn(usr, "movie ID is not an integer")
-
-			m := tg.NewMessage(cht, "There's no movie with such ID. Try better")
-			if _, err := bot.Send(m); err != nil {
-				log.Error(usr, err, "failed sending rate error back")
-			}
-			states[usr] = stateIdle
-			return
-		}
-
-		done, err := db.UnrateMovie(usr, id)
-		if err != nil {
-			log.Errorf(usr, err, "failed unrating movie '%d'", id)
-			return
-		}
-
-		states[usr] = stateIdle
-
-		if !done {
-			m := tg.NewMessage(cht, "It seems you've entered a wrong movie ID. Check it out")
-			if _, err := bot.Send(m); err != nil {
-				log.Errorf(usr, err, "failed handling state '%d'", state)
-			}
-			return
-		}
-
-		m := tg.NewMessage(cht, "Done")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling state '%d'", state)
-			return
-		}
-
-	case stateFind:
-		m := tg.NewMessage(cht, "Not implemented")
-		if _, err := bot.Send(m); err != nil {
-			log.Errorf(usr, err, "failed handling state '%d'", state)
-		}
-
-		states[usr] = stateIdle
+	case stageChooseUnrate:
+		keyboard = &keyboardUnrate
+		state.movie = *movieByID(usr, txt)
+		state.stage = stageUnrate
 	}
+
+	states[usr] = state
+	replaceMessage(usr, cht, state.mainMessageID, formatMovieWithHeaders(&state.movie), keyboard, state.stage)
+
+	dm := tg.NewDeleteMessage(cht, msg.MessageID)
+	// ignore bot.Send errors because it always fails to deserialize response
+	bot.Send(dm)
+}
+
+func movieByID(usr int64, strID string) *db.Movie {
+	var mv *db.Movie
+	id, err := strconv.Atoi(strID)
+	if err != nil {
+		cb := tg.NewCallbackWithAlert(time.Now().UTC().String(), fmt.Sprintf("The value %s doesn't seem a valid movie ID, isn't it?", strID))
+		if _, err = bot.Request(cb); err != nil {
+			log.Error(usr, err, "failed sending alert message")
+		}
+		mv = &db.Movie{}
+	} else {
+		mv, _ = db.GetMovie(usr, id)
+	}
+
+	return mv
 }
